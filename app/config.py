@@ -172,6 +172,17 @@ class CausalConfig:
     # Kinematic smoothing
     smooth_window: int = 5        # Savitzky-Golay window for smoothing speed/acceleration
 
+    # Root-cause ranking
+    max_alternative_causes: int = 4            # max distinct alternate causes kept alongside the primary one (5 total)
+    statistical_corroboration_bonus: float = 0.15  # confidence bonus when a consensus (PCMCI+/LiNGAM/GES/CausalForest) edge corroborates a rule-based event-causal edge
+    min_root_cause_confidence: float = 0.30    # candidate causes below this are dropped, not guessed
+
+    # SES (State-Event-State) narrative layer — deterministic narration over the
+    # above, not a fifth discovery method (see app/pipeline/causal_narrative.py)
+    ses_trend_threshold_mps2: float = 0.6      # |speed slope| below this is called "steady", not accel/decel
+    ses_lead_in_seconds: float = 3.0           # how far before the (first) cause event's onset the lead-up state window starts
+    ses_aftermath_seconds: float = 2.0         # how far after the primary event's confirmation the aftermath state window extends
+
 
 @dataclass(frozen=True)
 class SynthesisConfig:

@@ -48,6 +48,7 @@ from app.pipeline.causal_events import (
     generate_explanation,
     TemporalEvent,
 )
+from app.pipeline.causal_narrative import build_ses_narrative
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def _fps_from_df(df: pd.DataFrame) -> float:
 def _build_causal_variables(
     entity_series: Dict[str, pd.DataFrame],
     pair_series: Dict[Tuple[str, str], pd.DataFrame],
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     """
     Merge entity kinematics + pairwise features into a single wide DataFrame
     aligned on the UNION of frame_ids (NaN where an entity is absent), suitable
@@ -104,6 +105,11 @@ def _build_causal_variables(
       {oid_a}_{oid_b}_distance, ..._closing_speed, ..._relative_speed
 
     Only entities with enough valid frames are included.
+
+    Returns (wide_df, var_to_entities) where var_to_entities maps each variable
+    column name to the object id(s) it describes — built here, at construction
+    time, rather than reverse-parsed from the (ambiguous, underscore-heavy)
+    column name later.
     """
     # Find union of all frame IDs across all entities and pairs
     all_frames: set = set()
@@ -111,11 +117,12 @@ def _build_causal_variables(
         all_frames.update(sdf["frame_id"].astype(int).tolist())
 
     if not all_frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     all_frames_sorted = sorted(all_frames)
     base = pd.DataFrame({"frame_id": all_frames_sorted})
     new_cols = {}
+    var_to_entities: Dict[str, List[str]] = {}
 
     # Entity columns — only include entities with >= 10 valid speed frames
     for oid, sdf in entity_series.items():
@@ -126,9 +133,11 @@ def _build_causal_variables(
         safe_oid = str(oid).replace("-", "_").replace(" ", "_")
         for col in ["speed", "acceleration", "vx", "vy", "heading", "ax", "ay"]:
             if col in sdf_idx.columns:
-                new_cols[f"{safe_oid}_{col}"] = base["frame_id"].map(
+                varname = f"{safe_oid}_{col}"
+                new_cols[varname] = base["frame_id"].map(
                     sdf_idx[col].to_dict()
                 ).astype(float)
+                var_to_entities[varname] = [oid]
 
     # Pairwise columns
     for (id_a, id_b), pf in pair_series.items():
@@ -138,14 +147,16 @@ def _build_causal_variables(
         label = f"{id_a}_{id_b}".replace("-", "_").replace(" ", "_")
         for col in ["distance", "closing_speed", "relative_speed", "relative_acceleration", "heading_difference"]:
             if col in pf_idx.columns:
-                new_cols[f"{label}_{col}"] = base["frame_id"].map(
+                varname = f"{label}_{col}"
+                new_cols[varname] = base["frame_id"].map(
                     pf_idx[col].to_dict()
                 ).astype(float)
+                var_to_entities[varname] = [id_a, id_b]
 
     if new_cols:
         base = pd.concat([base, pd.DataFrame(new_cols)], axis=1)
 
-    return base.sort_values("frame_id").reset_index(drop=True)
+    return base.sort_values("frame_id").reset_index(drop=True), var_to_entities
 
 
 def _causal_forest_treatments(
@@ -324,7 +335,7 @@ class CausalEngine:
         pair_series = compute_pairwise_features(entity_series)
 
         # ── 3. Build wide causal variable matrix ─────────────────────────────
-        wide_df = _build_causal_variables(entity_series, pair_series)
+        wide_df, var_to_entities = _build_causal_variables(entity_series, pair_series)
         if wide_df.empty:
             return {
                 "status": "insufficient",
@@ -382,20 +393,37 @@ class CausalEngine:
             all_events.extend(extract_pairwise_events(id_a, id_b, pf))
 
         # ── 7. Event-level causal chain ───────────────────────────────────────
-        event_edges = build_event_causal_chain(all_events, entity_series, pair_series, fps=fps)
+        # Corroborate rule-based event links with the statistical consensus edges
+        # (PCMCI+/LiNGAM/GES/CausalForest) instead of reasoning about them in isolation.
+        event_edges = build_event_causal_chain(
+            all_events, entity_series, pair_series, fps=fps,
+            consensus_edges=consensus_edges, var_to_entities=var_to_entities,
+        )
 
         # ── 8. Event onset localization ───────────────────────────────────────
         localizer = EventOnsetLocalizer()
         onset_map = localizer.localize(all_events, entity_series, pair_series, fps=fps)
 
-        # ── 8.5 Prune graph to primary neighborhood ───────────────────────────
+        # ── 8.5 Rank root causes, then prune graph to their neighborhood ──────
         primary_evt = self._find_primary_event(all_events, onset_map)
-        all_events, event_edges = self._prune_graph_to_primary(primary_evt, all_events, event_edges)
+        root_cause = self._rank_root_causes(primary_evt, all_events, event_edges)
+        all_events, event_edges = self._prune_graph_to_primary(primary_evt, root_cause, all_events, event_edges)
 
         # ── 9. Build final graph nodes & edges ────────────────────────────────
         nodes = self._build_nodes(entity_series, all_events, onset_map)
         statistical_edges = consensus_edges
         temporal_edges = event_edges
+        relationship_graph = self._build_relationship_graph(
+            entity_series, all_events, consensus_edges, var_to_entities, onset_map,
+            primary_evt, root_cause,
+        )
+
+        # ── 9.5 SES (State-Event-State) narrative ─────────────────────────────
+        # Deterministic narration over the above — not a fifth discovery method,
+        # see app/pipeline/causal_narrative.py for the design rationale.
+        ses_narrative = build_ses_narrative(
+            primary_evt, root_cause, all_events, onset_map, entity_series, pair_series,
+        )
 
         # ── 10. Explanation ───────────────────────────────────────────────────
         explanation = generate_explanation(all_events, event_edges, onset_map, entity_series)
@@ -422,6 +450,9 @@ class CausalEngine:
             "n_timesteps": len(wide_df),
 
             "primary_event": primary_evt,
+            "root_cause": root_cause,
+            "relationship_graph": relationship_graph,
+            "ses_narrative": ses_narrative,
 
             "entities": [
                 {
@@ -475,8 +506,9 @@ class CausalEngine:
             "confidence": overall_conf,
 
             "note": (
-                "Multi-method causal engine (PCMCI+, LiNGAM, GES, CausalForest). "
-                "Statistical results are ranked hypotheses, not causal proof."
+                "Multi-method causal engine (PCMCI+, LiNGAM, GES, CausalForest) narrated as a "
+                "deterministic State-Event-State (SES) chain. Statistical results are ranked "
+                "hypotheses, not causal proof."
             ),
         }
 
@@ -488,18 +520,28 @@ class CausalEngine:
     def _prune_graph_to_primary(
         self,
         primary_evt: Optional[Dict],
+        root_cause: Optional[Dict],
         all_events: List[TemporalEvent],
         event_edges: List[Dict]
     ) -> Tuple[List[TemporalEvent], List[Dict]]:
-        """Isolate the causal neighborhood of the primary event (depth 2)."""
+        """Isolate the causal neighborhood (depth 2) of the primary event AND every
+        ranked candidate cause, so alternate-cause evidence survives pruning too."""
         if not primary_evt:
             return all_events, event_edges
 
-        pid = primary_evt["event_id"]
-        distances = {pid: 0}
-        
+        protected_ids = {primary_evt["event_id"]}
+        if root_cause:
+            pc = root_cause.get("primary_cause")
+            if pc and pc.get("cause_event_id"):
+                protected_ids.add(pc["cause_event_id"])
+            for alt in root_cause.get("alternative_causes") or []:
+                if alt.get("cause_event_id"):
+                    protected_ids.add(alt["cause_event_id"])
+
+        distances = {pid: 0 for pid in protected_ids}
+
         # Trace backwards (causes)
-        q = [pid]
+        q = list(protected_ids)
         while q:
             curr = q.pop(0)
             d = distances[curr]
@@ -511,9 +553,9 @@ class CausalEngine:
                     if src not in distances:
                         distances[src] = d + 1
                         q.append(src)
-                        
+
         # Trace forwards (consequences)
-        q = [pid]
+        q = list(protected_ids)
         while q:
             curr = q.pop(0)
             d = distances[curr]
@@ -533,6 +575,242 @@ class CausalEngine:
             if e["source_event_id"] in connected_events and e["target_event_id"] in connected_events
         ]
         return filtered_events, filtered_edges
+
+    def _rank_root_causes(
+        self,
+        primary_evt: Optional[Dict],
+        all_events: List[TemporalEvent],
+        event_edges: List[Dict],
+    ) -> Dict:
+        """
+        Rank the candidate causes of the primary event instead of picking exactly
+        one: walks causal predecessors of the primary event (direct + one further
+        hop back), deduplicates so alternates are genuinely distinct (different
+        event type or different entities — never a restatement of the primary
+        cause), and keeps the top `settings.causal.max_alternative_causes`.
+
+        If nothing clears `settings.causal.min_root_cause_confidence`, returns an
+        explicit "no corroborated precipitating cause" primary cause rather than
+        guessing one.
+        """
+        empty = {"primary_cause": None, "alternative_causes": []}
+        if not primary_evt:
+            return empty
+
+        pid = primary_evt["event_id"]
+        events_by_id = {e.event_id: e for e in all_events}
+        candidates: Dict[str, Dict] = {}
+
+        def _consider(edge: Dict, hop: int) -> None:
+            src_id = edge["source_event_id"]
+            if src_id == pid:
+                return
+            src_evt = events_by_id.get(src_id)
+            if src_evt is None:
+                return
+            conf = edge["confidence"] * (0.85 if hop == 2 else 1.0)
+            existing = candidates.get(src_id)
+            if existing is None or conf > existing["confidence"]:
+                candidates[src_id] = {
+                    "cause_event_id": src_id,
+                    "event_type": src_evt.event_type,
+                    "object_ids": src_evt.object_ids,
+                    "confidence": conf,
+                    "lag_seconds": edge.get("lag_seconds"),
+                    "evidence": edge.get("evidence", []),
+                    "corroborated_by": edge.get("corroborated_by", []),
+                }
+
+        for edge in event_edges:
+            if edge["target_event_id"] == pid and edge["relationship"] in ("causes", "supports"):
+                _consider(edge, hop=1)
+
+        direct_ids = set(candidates.keys())
+        for edge in event_edges:
+            if edge["target_event_id"] in direct_ids and edge["relationship"] in ("causes", "supports"):
+                _consider(edge, hop=2)
+
+        floor = settings.causal.min_root_cause_confidence
+        ranked = sorted(candidates.values(), key=lambda c: -c["confidence"])
+        ranked = [c for c in ranked if c["confidence"] >= floor]
+
+        # Dedup: alternates must be a genuinely distinct reason, not the same one.
+        distinct: List[Dict] = []
+        seen_signatures = set()
+        for c in ranked:
+            sig = (c["event_type"], tuple(sorted(c["object_ids"])))
+            if sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+            distinct.append(c)
+
+        def _label(c: Dict) -> str:
+            objs = ", ".join(c["object_ids"])
+            return f"{c['event_type'].replace('_', ' ').title()} involving {objs}"
+
+        def _mechanism(c: Dict) -> str:
+            ev = "; ".join(c["evidence"][:3]) if c["evidence"] else "temporal precedence only"
+            lag = c.get("lag_seconds")
+            lag_str = f"Preceded the incident by {lag:.1f}s. " if lag is not None else ""
+            return f"{lag_str}Evidence: {ev}."
+
+        def _finalize(c: Dict) -> Dict:
+            return {
+                "label": _label(c),
+                "cause_event_id": c["cause_event_id"],
+                "object_ids": c["object_ids"],
+                "mechanism": _mechanism(c),
+                "confidence": round(min(c["confidence"], 1.0), 4),
+                "corroborated_by": c.get("corroborated_by", []),
+                "lag_seconds": round(c["lag_seconds"], 3) if c.get("lag_seconds") is not None else None,
+            }
+
+        if not distinct:
+            return {
+                "primary_cause": {
+                    "label": f"No corroborated precipitating cause identified for the "
+                             f"{primary_evt['event_type'].replace('_', ' ').title()}",
+                    "cause_event_id": pid,
+                    "object_ids": primary_evt["object_ids"],
+                    "mechanism": (
+                        "No preceding event met the minimum causal-confidence threshold "
+                        f"({floor:.2f}); this may be an independent manoeuvre rather than a "
+                        "reaction to another entity."
+                    ),
+                    "confidence": primary_evt["confidence"],
+                    "corroborated_by": [],
+                    "lag_seconds": None,
+                },
+                "alternative_causes": [],
+            }
+
+        max_alts = settings.causal.max_alternative_causes
+        return {
+            "primary_cause": _finalize(distinct[0]),
+            "alternative_causes": [_finalize(c) for c in distinct[1:1 + max_alts]],
+        }
+
+    def _build_relationship_graph(
+        self,
+        entity_series: Dict[str, pd.DataFrame],
+        all_events: List[TemporalEvent],
+        consensus_edges: List[Dict],
+        var_to_entities: Dict[str, List[str]],
+        onset_map: Dict[str, Dict],
+        primary_evt: Optional[Dict],
+        root_cause: Optional[Dict],
+    ) -> Dict:
+        """
+        A small, ready-to-render "hypothesis graph": the primary event plus its
+        ranked causes (root_cause.primary_cause + alternative_causes — the same
+        ≤5 hypotheses shown in the root-cause panel) and the entities involved
+        in them, nothing else.
+
+        Deliberately NOT built from the full event-chain graph: on a busy scene
+        that chain can have hundreds of events and thousands of edges (every
+        temporally-ordered pair above the confidence floor gets one), and a
+        depth-2 neighborhood of that is still nearly the whole graph — nothing
+        useful renders. Scoping to the ranked hypotheses keeps the graph at
+        the size a person can actually read: ~6 event nodes, a handful of
+        entities, one causal edge per hypothesis.
+        """
+        events_by_id = {e.event_id: e for e in all_events}
+
+        hypothesis_ids: List[str] = []
+        if primary_evt:
+            hypothesis_ids.append(primary_evt["event_id"])
+        cause_entries: List[Dict] = []
+        if root_cause:
+            if root_cause.get("primary_cause"):
+                cause_entries.append(root_cause["primary_cause"])
+            cause_entries.extend(root_cause.get("alternative_causes") or [])
+        for c in cause_entries:
+            cid = c.get("cause_event_id")
+            if cid and cid in events_by_id and cid not in hypothesis_ids:
+                hypothesis_ids.append(cid)
+
+        relevant_events = [events_by_id[eid] for eid in hypothesis_ids if eid in events_by_id]
+        relevant_entity_ids = sorted({oid for evt in relevant_events for oid in evt.object_ids})
+
+        nodes: List[Dict] = []
+        node_ids: set = set()
+
+        for oid in relevant_entity_ids:
+            sdf = entity_series.get(oid)
+            nid = f"entity_{oid}"
+            node_ids.add(nid)
+            cls = (str(sdf["class"].dropna().iloc[0])
+                   if sdf is not None and "class" in sdf.columns and not sdf["class"].dropna().empty
+                   else "vehicle")
+            nodes.append({
+                "id": nid, "kind": "entity", "label": f"{cls} {oid}",
+                "object_ids": [oid], "class": cls, "event_type": None,
+                "timestamp": None, "confidence": 1.0,
+            })
+
+        for evt in relevant_events:
+            node_ids.add(evt.event_id)
+            onset_info = onset_map.get(evt.event_id, {})
+            nodes.append({
+                "id": evt.event_id, "kind": "event", "label": evt.event_type.replace("_", " ").title(),
+                "object_ids": evt.object_ids, "class": None, "event_type": evt.event_type,
+                "timestamp": onset_info.get("onset_timestamp", evt.start_timestamp),
+                "frame": onset_info.get("onset_frame", evt.start_frame),
+                "confidence": evt.confidence,
+            })
+
+        edges: List[Dict] = []
+
+        # event_event_causal — one edge per ranked hypothesis, straight into the
+        # primary event, using the same confidence already shown in the panel
+        # (rather than re-deriving it from the dense raw event-chain edges).
+        if primary_evt:
+            pid = primary_evt["event_id"]
+            for c in cause_entries:
+                cid = c.get("cause_event_id")
+                if not cid or cid not in node_ids or cid == pid:
+                    continue
+                edges.append({
+                    "source": cid, "target": pid,
+                    "kind": "event_event_causal", "relationship": "causes",
+                    "confidence": c["confidence"], "lag_seconds": c.get("lag_seconds"),
+                    "label": "causes",
+                })
+
+        # entity_entity_statistical — only between entities that appear in the
+        # hypothesis events above, so this stays a handful of edges at most.
+        best_stat: Dict[Tuple[str, str], Dict] = {}
+        for e in consensus_edges:
+            src_ents = var_to_entities.get(e["source"], [])
+            tgt_ents = var_to_entities.get(e["target"], [])
+            for s in src_ents:
+                for t in tgt_ents:
+                    if s == t or f"entity_{s}" not in node_ids or f"entity_{t}" not in node_ids:
+                        continue
+                    key = tuple(sorted((s, t)))
+                    if key not in best_stat or e["final_confidence"] > best_stat[key]["confidence"]:
+                        best_stat[key] = {
+                            "source": f"entity_{s}", "target": f"entity_{t}",
+                            "kind": "entity_entity_statistical", "relationship": e["relationship"],
+                            "confidence": e["final_confidence"], "lag_seconds": e.get("lag_seconds"),
+                            "label": f"{e['source']} → {e['target']}",
+                        }
+        edges.extend(best_stat.values())
+
+        # entity_event_involvement — which of the relevant entities appear in
+        # which hypothesis event.
+        for evt in relevant_events:
+            for oid in evt.object_ids:
+                eid = f"entity_{oid}"
+                if eid in node_ids:
+                    edges.append({
+                        "source": eid, "target": evt.event_id,
+                        "kind": "entity_event_involvement", "relationship": "involves",
+                        "confidence": evt.confidence, "lag_seconds": None,
+                        "label": "involved in",
+                    })
+
+        return {"nodes": nodes, "edges": edges}
 
     def _find_primary_event(
         self,
@@ -660,6 +938,8 @@ class CausalEngine:
             "n_consensus_edges": len(consensus_edges),
             "n_temporal_events": len(result.get("temporal_events", [])),
             "primary_event": result.get("primary_event"),
+            "root_cause": result.get("root_cause"),
+            "ses_narrative": result.get("ses_narrative"),
             "explanation": result.get("explanation"),
             "confidence": result.get("confidence"),
         }

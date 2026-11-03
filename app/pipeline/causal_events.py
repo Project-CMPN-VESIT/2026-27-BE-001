@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,12 +426,45 @@ def _granger_check(
         return False, 0.0
 
 
+def _statistical_corroboration(
+    evt_a_objects: List[str],
+    evt_b_objects: List[str],
+    consensus_edges: Optional[List[Dict]],
+    var_to_entities: Optional[Dict[str, List[str]]],
+) -> Tuple[bool, List[str]]:
+    """
+    Check whether the statistical engine (PCMCI+/LiNGAM/GES/CausalForest consensus)
+    independently found a causal/supportive link between the entities behind evt_a
+    and the entities behind evt_b, in either direction. Returns (found, methods).
+    """
+    if not consensus_edges or not var_to_entities:
+        return False, []
+    a_set, b_set = set(evt_a_objects), set(evt_b_objects)
+    best_methods: List[str] = []
+    for edge in consensus_edges:
+        if edge.get("relationship") not in ("causes", "supports"):
+            continue
+        src_entities = set(var_to_entities.get(edge.get("source"), []))
+        tgt_entities = set(var_to_entities.get(edge.get("target"), []))
+        if not src_entities or not tgt_entities:
+            continue
+        aligned = (src_entities & a_set and tgt_entities & b_set) or \
+                  (src_entities & b_set and tgt_entities & a_set)
+        if aligned:
+            methods = list((edge.get("method_support") or {}).keys())
+            if len(methods) > len(best_methods):
+                best_methods = methods
+    return bool(best_methods) or False, best_methods
+
+
 def build_event_causal_chain(
     all_events: List[TemporalEvent],
     entity_series: Dict[str, pd.DataFrame],
     pair_series: Dict[Tuple[str, str], pd.DataFrame],
     fps: float = 10.0,
     max_causal_gap_s: float = 5.0,
+    consensus_edges: Optional[List[Dict]] = None,
+    var_to_entities: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict]:
     """
     For every pair of temporally ordered events (A before B), assess whether
@@ -438,9 +473,14 @@ def build_event_causal_chain(
       1. A ends before B starts (temporal precedence)
       2. Kinematic/interaction evidence in the gap supports linkage
       3. Optionally Granger-style predictive check
+      4. Independent corroboration from the statistical consensus engine
+         (PCMCI+/LiNGAM/GES/CausalForest) — a confidence bonus, not a
+         requirement, since the statistical engine only sees a capped subset
+         of variables and can legitimately miss a real link.
 
     Returns a list of causal edge dicts (event-level):
-      {source_event_id, target_event_id, relationship, confidence, lag_seconds, evidence}
+      {source_event_id, target_event_id, relationship, confidence, lag_seconds,
+       evidence, corroborated_by}
     """
     edges = []
     evts = sorted(all_events, key=lambda e: e.start_timestamp)
@@ -521,6 +561,15 @@ def build_event_causal_chain(
                             conf += 0.1
                             evidence.append(f"closing_speed_positive:{pa}↔{pb}")
 
+            # 5. Independent corroboration from the statistical consensus engine —
+            # this is what actually connects the two causal subsystems.
+            corroborated, corr_methods = _statistical_corroboration(
+                evt_a.object_ids, evt_b.object_ids, consensus_edges, var_to_entities
+            )
+            if corroborated:
+                conf += settings.causal.statistical_corroboration_bonus
+                evidence.append(f"statistical_corroboration:{','.join(corr_methods)}")
+
             conf = min(conf, 1.0)
             if conf < 0.35:
                 continue
@@ -538,6 +587,7 @@ def build_event_causal_chain(
                 "confidence": round(conf, 4),
                 "lag_seconds": round(gap_s, 3),
                 "evidence": evidence,
+                "corroborated_by": corr_methods,
             })
 
     return edges

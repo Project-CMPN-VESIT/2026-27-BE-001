@@ -154,39 +154,16 @@ def _build_evidence(event_id: str) -> dict | None:
     window_s = [round(float(ts.min()), 1), round(float(ts.max()), 1)] if ts.size else \
         [-settings.video.pre_buffer_seconds, settings.video.post_trigger_seconds]
 
-    # ── causal findings (Track 2) — one summary per analyzed target ──────────
-    causal: list[dict] | None = None
-    episode: dict | None = None
+    # ── causal findings (Track 2) — ranked primary + alternative causes ──────
+    primary_event: dict | None = None
+    root_cause: dict | None = None
+    ses_narrative: dict | None = None
     if causal_path.exists():
         try:
             cg = json.loads(causal_path.read_text(encoding="utf-8"))
-            causal = []
-            for t in cg.get("targets", []):
-                drivers = t.get("drivers_of_target_speed", [])
-                external = [l for l in drivers if l.get("cause") != "tgt_speed"]
-                causal.append({
-                    "target_object": t.get("target_object"),
-                    "target_class": t.get("target_class"),
-                    "target_speed_drop_mps": t.get("target_speed_drop_mps"),
-                    "external_drivers": external,
-                    "interpretation": (
-                        "No inter-vehicle reactive-braking chain detected — the target's "
-                        "speed change is explained by its own past only (consistent with an "
-                        "impact or an independent manoeuvre, not a following response)."
-                        if not external else
-                        "Reactive coupling detected: " + "; ".join(
-                            f"{l['cause']} at lag {l['lag']} (strength {l['strength']})" for l in external)
-                    ),
-                })
-            ep = cg.get("episode")
-            if isinstance(ep, dict) and ep.get("nodes"):
-                episode = {
-                    "nodes": [{"node_id": n.get("node_id"), "state": n.get("state"),
-                               "window_s": n.get("window_s"), "evidence": n.get("evidence")}
-                              for n in ep["nodes"]],
-                    "relations": ep.get("relations") or [],
-                    "root_cause": ep.get("root_cause") or {},
-                }
+            primary_event = cg.get("primary_event")
+            root_cause = cg.get("root_cause")
+            ses_narrative = cg.get("ses_narrative")
         except Exception as exc:
             logger.warning("Could not read causal graph: %s", exc)
 
@@ -202,8 +179,9 @@ def _build_evidence(event_id: str) -> dict | None:
             "class_counts": class_counts, "window_s": window_s,
         },
         "entities": entities,
-        "causal": causal,
-        "episode": episode,
+        "primary_event": primary_event,
+        "root_cause": root_cause,
+        "ses_narrative": ses_narrative,
     }
 
 
@@ -237,33 +215,42 @@ def _format_evidence(e: dict) -> str:
                 s += f" — closest entity at that instant: {na['class']} {na['object_id']} ({na['distance_m']} m away)"
             lines.append(s)
     lines.append("")
-    if e["causal"]:
-        lines.append("CAUSAL ASSESSMENT (Track 2 / PCMCI+):")
-        for c in e["causal"]:
-            lines.append(f"  Target: {c.get('target_class')} {c.get('target_object')} "
-                         f"(speed drop {c.get('target_speed_drop_mps')} m/s).")
-            lines.append(f"    {c.get('interpretation')}")
+    pe = e.get("primary_event")
+    if pe:
+        lines.append(f"PRIMARY EVENT (what happened): {pe.get('event_type', '').replace('_', ' ').title()} "
+                     f"involving {', '.join(pe.get('object_ids') or [])} at "
+                     f"t={pe.get('event_onset', {}).get('timestamp')}s "
+                     f"(confidence {pe.get('confidence')}).")
+    rc = e.get("root_cause")
+    if rc and rc.get("primary_cause"):
+        pc = rc["primary_cause"]
+        lines.append("")
+        lines.append(f"REASON FOR INCIDENT (primary cause, confidence {pc.get('confidence')}): {pc.get('label')}")
+        lines.append(f"  Mechanism: {pc.get('mechanism')}")
+        if pc.get("corroborated_by"):
+            lines.append(f"  Statistically corroborated by: {', '.join(pc['corroborated_by'])}")
+        alts = rc.get("alternative_causes") or []
+        if alts:
+            lines.append("")
+            lines.append("OTHER POSSIBLE EXPLANATIONS (distinct from the primary cause, ranked by confidence):")
+            for a in alts:
+                lines.append(f"  (confidence {a.get('confidence')}) {a.get('label')} — {a.get('mechanism')}")
     else:
         lines.append("CAUSAL ASSESSMENT: not available (causal analysis not run).")
-    ep = e.get("episode")
-    if ep:
+    ses = e.get("ses_narrative")
+    if ses and ses.get("chain"):
         lines.append("")
-        lines.append("STAGED EPISODE NARRATIVE (staged nodes, typed relations, root cause):")
-        for n in ep.get("nodes") or []:
-            w = n.get("window_s") or [None, None]
-            evid = "; ".join(n.get("evidence") or [])
-            lines.append(f"  {n.get('node_id')} {n.get('state')}: {w[0]}s..{w[1]}s — {evid}")
-        for r in ep.get("relations") or []:
-            lines.append(f"  Relation: {r.get('source_node')} → {r.get('target_node')} "
-                         f"({r.get('relation_type')}): {r.get('mechanism')}")
-        rc = ep.get("root_cause") or {}
-        if rc.get("primary_factor"):
-            p = rc["primary_factor"]
-            lines.append(f"  Root cause (primary): {p.get('kind')} — {p.get('text')}")
-        for label, key in (("contributing", "contributing_factors"),
-                           ("mitigating", "mitigating_factors")):
-            for f in rc.get(key) or []:
-                lines.append(f"    {label}: {f}")
+        lines.append("CAUSAL NARRATIVE (deterministic State→Event→State chain — the same evidence above, ordered as a story):")
+        for node in ses["chain"]:
+            if node["kind"] == "state":
+                w = node["window_s"]
+                lines.append(f"  [{node['label']}] t={w[0]}s..{w[1]}s: {node['summary']}")
+            else:
+                corro = f", corroborated by {', '.join(node['corroborated_by'])}" if node.get("corroborated_by") else ""
+                lines.append(
+                    f"  -> {node['label']} ({', '.join(node['object_ids'])}) at t={node['timestamp']}s, "
+                    f"confidence {node['confidence']}{corro}"
+                )
     return "\n".join(lines)
 
 
@@ -276,11 +263,17 @@ _SYSTEM = (
     "low-confidence points. If INCIDENT INDICATORS are listed, lead the Summary with the likely "
     "collision/impact they suggest (name the vehicle and, if given, the nearest entity it may have "
     "struck), while making clear it is inferred from kinematics + track loss, not directly observed. "
-    "If a STAGED EPISODE NARRATIVE is present, organise the SitRep around its stage chain "
-    "(Stable → Trigger/Critical → Incident → Hazard Response → Recovery): the Kinematic Timeline "
-    "section should mirror the node windows, and the Causal Assessment section should reflect the "
-    "typed relations (direct cause, triggered response, consequence) and the stated root cause and "
-    "contributing/mitigating factors — attributions are hypotheses from kinematics, not facts. "
+    "If a REASON FOR INCIDENT is given, that is the system's primary causal hypothesis — state it "
+    "plainly in the Causal Assessment section together with its exact confidence number from the "
+    "data (do not invent your own). If OTHER POSSIBLE EXPLANATIONS are given, list them as distinct "
+    "alternative hypotheses with their own confidence numbers — never merge them with the primary "
+    "cause or restate the primary cause as an alternative. If neither is present, say the cause is "
+    "undetermined. Attributions are hypotheses from kinematics, not facts. "
+    "If a CAUSAL NARRATIVE (State→Event→State chain) is given, use its state/event ordering to write "
+    "the Kinematic Timeline section as a short chronological story (lead-up, then the precipitating "
+    "event, then the incident, then the aftermath) instead of an unordered list — it is the same "
+    "evidence as elsewhere in this packet, already sequenced for you; do not add stages it doesn't "
+    "contain. "
     "Structure the report as: Summary; Entities Involved; Kinematic Timeline; Causal Assessment; "
     "Confidence & Caveats. Keep it under ~250 words."
 )

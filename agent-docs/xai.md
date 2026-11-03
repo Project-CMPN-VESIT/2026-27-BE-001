@@ -31,10 +31,7 @@ Track 4 is the **explainability layer** — it turns structured perception + cau
 - Vehicle/person counts, class breakdown, time window.
 
 **Causal findings (Track 2):**
-- Per-target: speed drop, external drivers (links where cause ≠ `tgt_speed`), interpretation string.
-
-**Episode (Track 2 staging):**
-- Deterministic staged narrative — entities/roles, N1→N5 stage windows, typed relations, root cause (same block under `episode` in `causal_graph.json`).
+- `primary_event` (what happened) and `root_cause` (`primary_cause` + `alternative_causes`, each with its own confidence and `corroborated_by`), plus `ses_narrative` (the deterministic State-Event-State chain — same evidence, sequenced as a story), all read straight from `causal_graph.json`.
 
 ### 2. Format Evidence (`_format_evidence`)
 
@@ -50,9 +47,21 @@ ENTITIES (kinematics from monocular bird's-eye-view; approximate):
 INCIDENT INDICATORS (sharp deceleration + abrupt mid-window track loss — possible collision/impact):
   V_01 (red car): decelerated, then track terminated at 4.2s — closest entity: truck V_03 (2.1 m away)
 
-CAUSAL ASSESSMENT (Track 2 / PCMCI+):
-  Target: car V_01 (speed drop 5.2 m/s).
-    Reactive coupling detected: rel_speed at lag 2 (strength 0.412)
+PRIMARY EVENT (what happened): Collision involving V_01, V_02 at t=0.0s (confidence 0.9).
+
+REASON FOR INCIDENT (primary cause, confidence 0.92): Closing Distance involving V_01, V_02
+  Mechanism: Preceded the incident by 1.1s. Evidence: shared_entities:V_01,V_02; event_type_pattern:CLOSING_DISTANCE→COLLISION.
+  Statistically corroborated by: PCMCI+
+
+OTHER POSSIBLE EXPLANATIONS (distinct from the primary cause, ranked by confidence):
+  (confidence 0.78) Sudden Braking involving V_01 — Preceded the incident by 0.2s...
+
+CAUSAL NARRATIVE (deterministic State→Event→State chain — the same evidence above, ordered as a story):
+  [Closing distance] t=-4.1s..-1.1s: V_01 steady at ~28 km/h; gap V_01↔V_02: 9.4 m (closing)
+  -> Closing Distance (V_01, V_02) at t=-1.1s, confidence 0.92, corroborated by PCMCI+
+  [Closing with braking response] t=-1.1s..0.0s: V_01 decelerating at ~18 km/h; gap 3.2 m (closing)
+  -> Collision (V_01, V_02) at t=0.0s, confidence 0.9
+  [Steady state] t=0.0s..2.0s: V_01 decelerating at ~4 km/h
 ```
 
 ### 3. Call LLM (`_call_llm`)
@@ -77,6 +86,8 @@ The LLM is instructed to:
 - Never invent vehicles, colours, actions, or outcomes
 - Not speculate about fault or injuries
 - Lead the Summary with likely collision/impact if incident indicators are present
+- State the primary cause plainly with its exact confidence number; list alternatives as distinct hypotheses with their own numbers, never merged with the primary
+- If a CAUSAL NARRATIVE is given, use its state/event ordering to write the Kinematic Timeline as a chronological story (lead-up → precipitating event → incident → aftermath) instead of an unordered list
 - Structure: Summary → Entities Involved → Kinematic Timeline → Causal Assessment → Confidence & Caveats
 - Keep under ~250 words
 

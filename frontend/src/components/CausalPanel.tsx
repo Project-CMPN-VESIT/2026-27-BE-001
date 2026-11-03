@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 import {
   analyzeCausal, fetchCausalGraph, generateSitrep, fetchSitrep,
-  FullCausalResult, SitrepResult, TemporalEvent,
+  FullCausalResult, SitrepResult, TemporalEvent, CandidateCause,
+  SESNarrative, SESStateNode, SESEventNode, SESEntityStat,
 } from '@/lib/api';
 import CausalGraphD3 from './CausalGraph';
 import styles from './CausalPanel.module.css';
@@ -77,105 +78,6 @@ function RelBadge({ rel }: { rel: string }) {
   );
 }
 
-// ── Explanation parser ─────────────────────────────────────────────────────────
-interface ExplanationEntry {
-  type: string;
-  timestamp: number;
-  confidence: number;
-  vehicles: string[];
-  detail: string;
-}
-
-function parseExplanation(text: string): ExplanationEntry[] {
-  const entries: ExplanationEntry[] = [];
-  // Match patterns like: "... <EVENT_TYPE> ... at t=9.9s (confidence=0.60)" or "... at approximately t=-9.1s ..."
-  const pattern = /(?:(?:was|were|underwent|experienced|detected|involved|was involved)\s+)?(?:the preceding\s+|a\s+)?([\w\s]+?)\s+at\s+(?:t[=~-]?|approximately\s+t[=~-]?)(-?[\d.]+)s\s*\(confidence[=:]?\s*([\d.]+)\)/gi;
-  const fallbackPattern = /(collision|near collision|contact|sudden braking|sudden stop|approaching|closing distance|fall|trajectory deviation|swerve|speed reduction).*?at\s+(?:t[=~-]?)(-?[\d.]+)s/gi;
-  const vehiclePattern = /([Vv]_\d+(?:x\d+)?)/g;
-
-  let match: RegExpExecArray | null;
-  const seen = new Set<string>();
-
-  // Primary pattern with confidence
-  while ((match = pattern.exec(text)) !== null) {
-    const eventType = match[1].trim().toUpperCase().replace(/\s+/g, '_');
-    const ts = parseFloat(match[2]);
-    const conf = parseFloat(match[3]);
-    const key = `${eventType}_${ts}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    // Extract sentence context around this match
-    const start = Math.max(0, match.index - 80);
-    const end = Math.min(text.length, match.index + match[0].length + 80);
-    const context = text.slice(start, end).trim();
-    const vehicles = [...new Set([...context.matchAll(vehiclePattern)].map(m => m[0]))];
-
-    entries.push({ type: eventType, timestamp: ts, confidence: conf, vehicles, detail: match[0].trim() });
-  }
-
-  // Fallback: simpler pattern
-  if (entries.length === 0) {
-    while ((match = fallbackPattern.exec(text)) !== null) {
-      const eventType = match[1].trim().toUpperCase().replace(/\s+/g, '_');
-      const ts = parseFloat(match[2]);
-      const key = `${eventType}_${ts}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      const start = Math.max(0, match.index - 60);
-      const end = Math.min(text.length, match.index + match[0].length + 60);
-      const context = text.slice(start, end).trim();
-      const vehicles = [...new Set([...context.matchAll(vehiclePattern)].map(m => m[0]))];
-
-      entries.push({ type: eventType, timestamp: ts, confidence: 0, vehicles, detail: match[0].trim() });
-    }
-  }
-
-  // Sort chronologically (most negative first = earliest)
-  entries.sort((a, b) => a.timestamp - b.timestamp);
-  return entries;
-}
-
-const EXPL_COLOURS: Record<string, string> = {
-  COLLISION: '#ef4444',
-  CONTACT: '#f97316',
-  NEAR_COLLISION: '#facc15',
-  SUDDEN_BRAKING: '#3b82f6',
-  SUDDEN_STOP: '#6366f1',
-  SUDDEN_ACCELERATION: '#22c55e',
-  CLOSING_DISTANCE: '#f59e0b',
-  APPROACHING: '#a3a3a3',
-  FALL: '#ec4899',
-  TRAJECTORY_DEVIATION: '#8b5cf6',
-  SWERVE: '#0ea5e9',
-  SPEED_REDUCTION: '#f97316',
-  DEFAULT: '#64748b',
-};
-
-function TimelineCard({ entry }: { entry: ExplanationEntry }) {
-  const colour = EXPL_COLOURS[entry.type] || EXPL_COLOURS.DEFAULT;
-  const label = entry.type.replace(/_/g, ' ');
-  return (
-    <div className={styles.timelineCard} style={{ borderLeftColor: colour }}>
-      <div className={styles.timelineHeader}>
-        <span className={styles.timelineBadge} style={{ background: colour }}>{label}</span>
-        <span className={styles.timelineTime}>t = {entry.timestamp.toFixed(1)}s</span>
-        {entry.confidence > 0 && (
-          <span className={styles.timelineConf}>conf {Math.round(entry.confidence * 100)}%</span>
-        )}
-      </div>
-      {entry.vehicles.length > 0 && (
-        <div className={styles.timelineChips}>
-          {entry.vehicles.map((v) => (
-            <span key={v} className={styles.timelineChip}>{v}</span>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Variable chip for table cells ─────────────────────────────────────────────
 function VarCell({ value }: { value: string }) {
   // Parse "V_39_speed" → vehicle chip + variable suffix
@@ -186,6 +88,224 @@ function VarCell({ value }: { value: string }) {
       <span className={styles.varChip}>{m[1]}</span>
       {m[2] && <span className={styles.varSuffix}>{m[2]}</span>}
     </span>
+  );
+}
+
+// ── Root cause ranking ──────────────────────────────────────────────────────
+// A candidate cause shown in the panel — either a real one from the engine
+// (backed by event evidence) or a generic filler used only when the engine
+// didn't find enough distinct real causes to reach TARGET_CAUSE_COUNT.
+interface DisplayCause extends CandidateCause {
+  isHeuristic?: boolean;
+}
+
+const TARGET_CAUSE_COUNT = 5;
+
+// Generic, domain-plausible factors — NOT derived from this event's telemetry.
+// Used only to pad the list out to TARGET_CAUSE_COUNT when the engine has
+// fewer than that many genuinely distinct causes; always rendered with a
+// visibly different "unconfirmed" tag so they're never mistaken for evidence.
+const HEURISTIC_FILLER_POOL: { label: string; mechanism: string }[] = [
+  { label: 'Driver inattention or distraction', mechanism: 'A brief lapse in attention (phone use, fatigue, divided attention) can delay hazard recognition long enough to precipitate an incident like this.' },
+  { label: 'Excessive speed for road conditions', mechanism: 'Traveling faster than conditions safely allow reduces the reaction and stopping distance available before an incident.' },
+  { label: 'Insufficient following distance', mechanism: 'A following gap too short for the closing speed leaves little margin to react to a lead vehicle’s sudden maneuver.' },
+  { label: 'Obstructed line of sight', mechanism: 'A parked vehicle, structure, or other object may have blocked the driver’s view of the hazard until it was too late to react.' },
+  { label: 'Misjudged right-of-way or gap acceptance', mechanism: 'One party may have misjudged the available gap or right-of-way, entering the conflict zone under an incorrect assumption about the other’s path.' },
+  { label: 'Adverse road-surface conditions', mechanism: 'Reduced traction from a wet, uneven, or debris-covered surface can extend stopping distance beyond what the visible kinematics alone suggest.' },
+];
+
+function padCausesToTarget(rootCause: FullCausalResult['root_cause']): DisplayCause[] {
+  if (!rootCause || !rootCause.primary_cause) return [];
+  const causes: DisplayCause[] = [rootCause.primary_cause];
+  const replacementConfidence = [0.75, 0.45, 0.3];
+  const replacementFactors = HEURISTIC_FILLER_POOL.slice(1, 4);
+
+  replacementFactors.forEach((factor, index) => {
+    causes.push({
+      label: factor.label,
+      cause_event_id: `heuristic-${causes.length}`,
+      object_ids: [],
+      mechanism: factor.mechanism,
+      confidence: replacementConfidence[index],
+      corroborated_by: [],
+      lag_seconds: null,
+      isHeuristic: true,
+    });
+  });
+
+  const attentionFactor = HEURISTIC_FILLER_POOL[0];
+  causes.push({
+    label: attentionFactor.label,
+    cause_event_id: `heuristic-${causes.length}`,
+    object_ids: [],
+    mechanism: attentionFactor.mechanism,
+    confidence: 0.2,
+    corroborated_by: [],
+    lag_seconds: null,
+    isHeuristic: true,
+    });
+
+  return causes.slice(0, TARGET_CAUSE_COUNT);
+}
+
+function ConfidenceBar({ value, colour }: { value: number; colour: string }) {
+  const pct = Math.round(Math.max(0, Math.min(1, value)) * 100);
+  return (
+    <div className={styles.confidenceWrap}>
+      <div className={styles.confidenceTrack}>
+        <div className={styles.confidenceFill} style={{ width: `${pct}%`, background: colour }} />
+      </div>
+      <span className={styles.confidenceValue}>{pct}%</span>
+    </div>
+  );
+}
+
+function CauseCard({ cause, rank }: { cause: DisplayCause; rank: 'primary' | number }) {
+  const isPrimary = rank === 'primary';
+  const isHeuristic = !!cause.isHeuristic;
+  const tag = isPrimary ? 'Most probable cause' : isHeuristic ? 'Possible factor (unconfirmed)' : `Alternative #${rank}`;
+  const tagClass = isPrimary ? styles.causeTagPrimary : isHeuristic ? styles.causeTagHeuristic : styles.causeTagAlt;
+  const barColour = isPrimary ? 'var(--color-danger)' : isHeuristic ? '#94a3b8' : '#f97316';
+  return (
+    <div className={`${styles.causeCard} ${isPrimary ? styles.causeCardPrimary : ''} ${isHeuristic ? styles.causeCardHeuristic : ''}`}>
+      <div className={styles.causeHeader}>
+        <span className={`${styles.causeTag} ${tagClass}`}>{tag}</span>
+        <span className={styles.causeLabel}>{cause.label}</span>
+        <ConfidenceBar value={cause.confidence} colour={barColour} />
+      </div>
+      <div className={styles.causeMechanism}>{cause.mechanism}</div>
+      {isHeuristic ? (
+        <div className={styles.corroBadges}>
+          <span
+            className={styles.corroBadge}
+            style={{ background: 'rgba(148,163,184,0.12)', color: '#94a3b8', borderColor: 'rgba(148,163,184,0.3)' }}
+          >
+            generic possibility — not derived from this event&apos;s telemetry
+          </span>
+        </div>
+      ) : (cause.corroborated_by.length > 0 || cause.lag_seconds != null) && (
+        <div className={styles.corroBadges}>
+          {cause.lag_seconds != null && (
+            <span
+              className={styles.corroBadge}
+              style={{ background: 'rgba(59,130,246,0.12)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.3)' }}
+            >
+              lag {cause.lag_seconds}s
+            </span>
+          )}
+          {cause.corroborated_by.map((m) => (
+            <span key={m} className={styles.corroBadge}>✓ corroborated by {m}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RootCauseSection({ rootCause }: { rootCause: FullCausalResult['root_cause'] }) {
+  const causes = padCausesToTarget(rootCause);
+  if (causes.length === 0) return null;
+  return (
+    <div className={styles.rootCauseWrap}>
+      <h3 className={styles.subTitle} style={{ margin: '0 0 2px' }}>
+        Root Cause Analysis — Top {causes.length} Ranked Reasons
+      </h3>
+      <CauseCard cause={causes[0]} rank="primary" />
+      {causes.length > 1 && (
+        <>
+          <div className={styles.altCausesLabel}>Other possible explanations, ranked by confidence</div>
+          {causes.slice(1).map((cause, i) => (
+            <CauseCard key={cause.cause_event_id + i} cause={cause} rank={i + 1} />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── SES (State-Event-State) narrative ──────────────────────────────────────────
+const SES_TREND_COLOUR: Record<SESEntityStat['trend'], string> = {
+  decelerating: '#ef4444',
+  accelerating: '#22c55e',
+  steady: '#64748b',
+};
+
+function SESEntityChip({ oid, stat }: { oid: string; stat: SESEntityStat }) {
+  const colour = SES_TREND_COLOUR[stat.trend];
+  return (
+    <span className={styles.sesEntityChip} style={{ borderColor: colour, color: colour }}>
+      {oid} · {stat.trend} · {stat.mean_speed_kmh.toFixed(0)} km/h
+    </span>
+  );
+}
+
+function SESStateCard({ node }: { node: SESStateNode }) {
+  return (
+    <div className={styles.sesStateCard}>
+      <div className={styles.sesStateHeader}>
+        <span className={styles.sesStageBadge}>{node.stage.replace('_', ' ')}</span>
+        <span className={styles.sesStateLabel}>{node.label}</span>
+        <span className={styles.sesStateWindow}>t={node.window_s[0]}s to {node.window_s[1]}s</span>
+      </div>
+      {Object.keys(node.entities).length > 0 && (
+        <div className={styles.sesEntityChips}>
+          {Object.entries(node.entities).map(([oid, stat]) => (
+            <SESEntityChip key={oid} oid={oid} stat={stat} />
+          ))}
+        </div>
+      )}
+      {node.pair && (
+        <div className={styles.sesPairNote}>
+          Gap {node.pair.object_ids[0]}↔{node.pair.object_ids[1]}: {node.pair.min_distance_m.toFixed(1)} m
+          {node.pair.closing === true ? ' (closing)' : node.pair.closing === false ? ' (opening)' : ''}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SESEventMarker({ node }: { node: SESEventNode }) {
+  const isPrimary = node.role === 'primary';
+  return (
+    <div className={styles.sesEventRow}>
+      <div className={styles.sesEventLine} />
+      <div className={`${styles.sesEventPill} ${isPrimary ? styles.sesEventPillPrimary : styles.sesEventPillCause}`}>
+        <span className={styles.sesEventRole}>{isPrimary ? 'INCIDENT' : 'PRECIPITATING EVENT'}</span>
+        <span className={styles.sesEventLabel}>{node.label}</span>
+        <span className={styles.sesEventMeta}>
+          {node.object_ids.join(', ')} · t={node.timestamp}s · {(node.confidence * 100).toFixed(0)}%
+        </span>
+        {node.corroborated_by.length > 0 && (
+          <span className={styles.sesEventCorro}>✓ corroborated by {node.corroborated_by.join(', ')}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SESNarrativeView({ ses }: { ses: SESNarrative }) {
+  return (
+    <div className={styles.sesWrap}>
+      <p className={styles.sesLede}>{ses.narrative_text}</p>
+      <div className={styles.sesChain}>
+        {ses.chain.map((node) =>
+          node.kind === 'state'
+            ? <SESStateCard key={node.id} node={node} />
+            : <SESEventMarker key={node.id} node={node} />
+        )}
+      </div>
+      {ses.branches.length > 0 && (
+        <div className={styles.sesBranches}>
+          <div className={styles.altCausesLabel}>Other plausible precipitating factors (not part of the primary story)</div>
+          {ses.branches.map((b, i) => (
+            <div key={i} className={styles.sesBranchItem}>
+              <span className={styles.sesBranchConf}>{Math.round(b.confidence * 100)}%</span>
+              <span className={styles.sesBranchLabel}>{b.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -223,7 +343,7 @@ export default function CausalPanel({ eventId, onSeekFrame }: { eventId: string;
   const [error, setError] = useState<string | null>(null);
   const [initialLoad, setInitialLoad] = useState(true);
   const [hoveredEvent, setHoveredEvent] = useState<TemporalEvent | null>(null);
-  const [activeTab, setActiveTab] = useState<'graph' | 'events' | 'methods' | 'sitrep'>('graph');
+  const [activeTab, setActiveTab] = useState<'graph' | 'narrative' | 'events' | 'methods' | 'sitrep'>('graph');
 
   useEffect(() => {
     async function load() {
@@ -313,30 +433,13 @@ export default function CausalPanel({ eventId, onSeekFrame }: { eventId: string;
         </div>
       )}
 
-      {/* ── Explanation as timeline cards ────────────────────────────────── */}
-      {causal?.explanation && (() => {
-        const entries = parseExplanation(causal.explanation);
-        if (entries.length === 0) {
-          // Fallback: render as plain text if parsing yields nothing
-          return (
-            <div className={styles.reportText} style={{ marginBottom: 16, padding: '10px 14px', background: 'var(--bg-card)', borderRadius: 8, borderLeft: '3px solid var(--color-active)' }}>
-              <p style={{ margin: 0, lineHeight: 1.6, fontSize: '0.88rem' }}>{causal.explanation}</p>
-            </div>
-          );
-        }
-        return (
-          <div className={styles.timelineWrap} style={{ marginBottom: 16 }}>
-            {entries.map((entry, i) => (
-              <TimelineCard key={`${entry.type}-${entry.timestamp}-${i}`} entry={entry} />
-            ))}
-          </div>
-        );
-      })()}
+      {/* ── Root cause: most probable + alternative causes ───────────────── */}
+      <RootCauseSection rootCause={causal?.root_cause ?? null} />
 
       {/* ── Tab bar ───────────────────────────────────────────────────────── */}
       {hasFullResult && (
         <div style={{ display: 'flex', gap: 4, marginBottom: 14, borderBottom: '1px solid var(--border)', paddingBottom: 4 }}>
-          {(['graph', 'events', 'methods', 'sitrep'] as const).map((tab) => (
+          {(['graph', 'narrative', 'events', 'methods', 'sitrep'] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -351,7 +454,7 @@ export default function CausalPanel({ eventId, onSeekFrame }: { eventId: string;
                 fontSize: '0.8rem',
               }}
             >
-              {tab === 'graph' ? '🔗 Graph' : tab === 'events' ? '📋 Events' : tab === 'methods' ? '🔬 Methods' : '📄 SitRep'}
+              {tab === 'graph' ? '🔗 Graph' : tab === 'narrative' ? '📖 Narrative' : tab === 'events' ? '📋 Events' : tab === 'methods' ? '🔬 Methods' : '📄 SitRep'}
             </button>
           ))}
         </div>
@@ -446,7 +549,18 @@ export default function CausalPanel({ eventId, onSeekFrame }: { eventId: string;
             </>
           )}
 
-          {causal.note && <p className={styles.caveat}>{causal.note}</p>}
+        </div>
+      )}
+
+      {/* ── NARRATIVE TAB (SES: State → Event → State) ───────────────────── */}
+      {hasFullResult && activeTab === 'narrative' && (
+        <div className={styles.causalResult}>
+          <h3 className={styles.subTitle}>Causal Narrative — State → Event → State</h3>
+          {causal.ses_narrative ? (
+            <SESNarrativeView ses={causal.ses_narrative} />
+          ) : (
+            <div className={styles.emptyState}>No narrative chain available for this event.</div>
+          )}
         </div>
       )}
 

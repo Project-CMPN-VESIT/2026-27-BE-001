@@ -212,23 +212,102 @@ export async function ragSearch(query: string, limit: number = 5): Promise<RAGSe
 
 // ── Causal Engine API (Track 2) — Full multi-method engine ───────────────────
 
-// ── Legacy types (kept for SitRep compatibility) ─────────────────────────────
-export interface CausalDriver {
-  cause: string;
-  lag: number;
-  strength: number;
+// ── Root-cause ranking types ──────────────────────────────────────────────────
+export interface CandidateCause {
+  label: string;
+  cause_event_id: string;
+  object_ids: string[];
+  mechanism: string;
+  confidence: number;
+  corroborated_by: string[];
+  lag_seconds: number | null;
 }
 
-export interface CausalTarget {
-  target_object: string;
-  target_class: string;
-  target_speed_drop_mps: number;
-  target_lead_fraction: number;
-  variables: string[];
-  n_timesteps: number;
-  tau_max: number;
-  pc_alpha_used?: number;
-  drivers_of_target_speed: CausalDriver[];
+export interface RootCause {
+  primary_cause: CandidateCause | null;
+  alternative_causes: CandidateCause[];
+}
+
+// ── SES (State-Event-State) narrative types ────────────────────────────────────
+export interface SESEntityStat {
+  mean_speed_kmh: number;
+  speed_trend_mps2: number;
+  trend: 'accelerating' | 'decelerating' | 'steady';
+}
+
+export interface SESPairStat {
+  object_ids: [string, string];
+  min_distance_m: number;
+  closing: boolean | null;
+}
+
+export interface SESStateNode {
+  kind: 'state';
+  id: string;
+  stage: 'lead_up' | 'transition' | 'aftermath';
+  label: string;
+  window_s: [number, number];
+  object_ids: string[];
+  entities: Record<string, SESEntityStat>;
+  pair: SESPairStat | null;
+  summary: string;
+}
+
+export interface SESEventNode {
+  kind: 'event';
+  id: string;
+  role: 'cause' | 'primary';
+  event_type: string;
+  label: string;
+  object_ids: string[];
+  timestamp: number;
+  confidence: number;
+  corroborated_by: string[];
+}
+
+export type SESChainNode = SESStateNode | SESEventNode;
+
+export interface SESBranch {
+  label: string;
+  cause_event_id: string | null;
+  confidence: number;
+  mechanism: string | null;
+  diverges_at: string;
+}
+
+export interface SESNarrative {
+  chain: SESChainNode[];
+  branches: SESBranch[];
+  method: string;
+  narrative_text: string;
+}
+
+// ── Relationship graph types ──────────────────────────────────────────────────
+export interface RelationshipNode {
+  id: string;
+  kind: 'entity' | 'event';
+  label: string;
+  object_ids: string[];
+  class: string | null;
+  event_type: string | null;
+  timestamp: number | null;
+  frame?: number;
+  confidence: number;
+}
+
+export interface RelationshipEdge {
+  source: string;
+  target: string;
+  kind: 'entity_entity_statistical' | 'event_event_causal' | 'entity_event_involvement';
+  relationship: string;
+  confidence: number;
+  lag_seconds: number | null;
+  label: string;
+}
+
+export interface RelationshipGraph {
+  nodes: RelationshipNode[];
+  edges: RelationshipEdge[];
 }
 
 // ── Full engine types ─────────────────────────────────────────────────────────
@@ -313,6 +392,9 @@ export interface FullCausalResult {
   n_causal_vars: number;
   n_timesteps: number;
   primary_event: PrimaryEvent | null;
+  root_cause: RootCause | null;
+  relationship_graph: RelationshipGraph | null;
+  ses_narrative: SESNarrative | null;
   entities: Array<{ object_id: string; class: string | null; n_frames: number; speed_range_mps: [number, number] | null }>;
   nodes: CausalNode[];
   statistical_causal_edges: CausalEdge[];
@@ -326,24 +408,6 @@ export interface FullCausalResult {
   explanation: string;
   confidence: number;
   note: string;
-}
-
-// Keep CausalResult as alias for backward compat with SitRep
-export interface CausalResult {
-  status: string;
-  message?: string;
-  event_id?: string;
-  targets?: CausalTarget[];
-  note?: string;
-  // Full engine fields (optional so old code doesn't break)
-  nodes?: CausalNode[];
-  consensus_edges?: CausalEdge[];
-  temporal_events?: TemporalEvent[];
-  temporal_event_edges?: CausalEventEdge[];
-  primary_event?: PrimaryEvent | null;
-  explanation?: string;
-  available_methods?: string[];
-  method_results?: Record<string, { status: string; n_edges: number }>;
 }
 
 /**
@@ -405,13 +469,9 @@ export interface SitrepEvidence {
   event: { event_id: string; source: string | null; trigger_time_s: number | null; duration_s: number | null };
   scene: { vehicles_tracked: number; persons_tracked: number; class_counts: Record<string, number>; window_s: [number, number] };
   entities: SitrepEntity[];
-  causal: {
-    target_object: string;
-    target_class: string;
-    target_speed_drop_mps: number;
-    external_drivers: CausalDriver[];
-    interpretation: string;
-  }[] | null;
+  primary_event: PrimaryEvent | null;
+  root_cause: RootCause | null;
+  ses_narrative: SESNarrative | null;
 }
 
 export interface SitrepResult {
