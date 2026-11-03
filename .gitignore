@@ -173,3 +173,5 @@ opencode.json
 yolo_test/*
 main.tex
 tmp*
+.DS_Store
+scratchpad/
